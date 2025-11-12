@@ -293,6 +293,12 @@ local Players 					= game:GetService("Players")
 
 local isServer 					= RunService:IsServer()
 
+if not ReplicatedStorage:FindFirstChild("Events") then
+	local EventsFolder = Instance.new("Folder")
+	EventsFolder.Name = "Events"
+	EventsFolder.Parent = ReplicatedStorage
+end
+
 --======================
 --// COFNIG //
 --======================
@@ -323,6 +329,8 @@ local eventGroups 				= {}			-- groupName -> { events = { eventName }, enabled =
 local eventToGroups				= {}		-- eventName -> groupName
 local activeNonces 				= {}			-- player.UserId -> { nonceString = expirationTime }
 local noncesCache 				= {}			-- player.UserId -> { eventName = { nonce, timestamp } }
+
+
 
 --======================
 --// DEBUG //
@@ -890,7 +898,4 @@ if isServer then
 	end)
 end
 
-
 return NetworkService
-
-
