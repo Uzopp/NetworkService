@@ -1,6 +1,6 @@
 Full documentation can be found on the script.
 
-📄 License — “UZOPH Module License”
+📄 License
 
 Copyright © 2025 UZOPH
 
