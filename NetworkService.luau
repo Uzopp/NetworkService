@@ -50,7 +50,7 @@ Notes:
     • Invalid or expired nonces do not error; the event is simply ignored.
 
 
-NOTE! This module is still in BETA and you might encounter errors and problems. Please report them trough discord to user: @uzuphh
+NOTE! This module is still in BETA and you might encounter errors and problems. Please report them trough discord to user: @uzophh
 
 
 
@@ -889,5 +889,6 @@ if isServer then
 		c2sListeners[Player] = nil 
 	end)
 end
+
 
 return NetworkService
