@@ -3,9 +3,9 @@
                  NetworkService Module
 ==================================================
 Author: UZOPH
-Version: v.0.2 [BETA]
+Version: v.0.2.1 [BETA]
 
-v.0.2  ADDED:
+v.0.21  ADDED:
 --------------------------------------------------
 Nonces (Client → Server Replay Protection)
 --------------------------------------------------
@@ -36,7 +36,9 @@ On the server C2S validator:
         return true -- normal validation logic
     end, function(player, args)
         -- runs only if nonce was valid and event was authorized
-    end)
+    end, { requiresNonce = true } )
+
+	IF C2S validator has { requiresNonce = false } it will ignore the packet sent from local
 
 Manual Nonce Request (advanced):
     local nonce = NetworkService:RequestServer("__NONCE", { EventName = "MyEvent" })
@@ -49,8 +51,11 @@ Notes:
     • Nonces are optional per event — use `requiresNonce = true` to enforce.
     • Invalid or expired nonces do not error; the event is simply ignored.
 
+FIXED:
+- Added type annotations for more clear debugging and structure
+- Fixed Nonce feature where even if
 
-NOTE! This module is still in BETA and you might encounter errors and problems. Please report them trough discord to user: @uzuphh
+NOTE! This module is still in BETA and you might encounter errors and problems. Please report them trough discord to user: @uzophh
 
 
 
@@ -282,55 +287,99 @@ Notes & Best practices:
 ==================================================
 ]]
 
+--======================
+--// TYPES //
+--======================
+export type Validator       = (player: Player, args: { any }) -> ( boolean, string? )
+export type Listener        = (player: Player, args: { any }) -> ()
+export type C2SEventConfig  = {
+    validators: { Validator },
+    listeners:  { Listener },
+	options: { any }?
+}
+export type S2CListener     = (args: {any}) -> ()
+export type S2CEventConfig  = {
+    listeners: { S2CListener },
+}
+export type RequestHandler  = (player: Player, args: { any }?) -> any
+export type SpyCallback     = (eventName: string, direction: "C2S" | "S2C", player: Player?, ...any) -> ()
+export type RateLimitEntry  = {
+    count: number,
+    lastReset: number,
+}
+export type ScopeEntry      = {
+    disconnectors: { () -> () },
+}
+export type Scope           = {
+    RegisterS2C: (self: Scope, eventName: string, listener: S2CListener) -> (),
+    Destroy:     (self: Scope) -> (),
+}
+export type EventGroup      = {
+    events: {string},
+    enabled: boolean,
+}
+export type NonceEntry      = { [string]: number } 
+export type NonceCacheEntry = {
+    nonce: string,
+    timestamp: number,
+}
+export type NonceCacheMap   = { [string]: NonceCacheEntry }
+export type TrafficEntry    = {
+    time: number,
+    event: string,
+    dir: string,
+    sender: string,
+    args: {string},
+}
+export type FireOptions     = {
+    requiresNonce: boolean?
+}
 
 --======================
 --// SERVICES //
 --======================
-local HttpService 				= game:GetService("HttpService")
-local ReplicatedStorage 		= game:GetService("ReplicatedStorage")
-local RunService 				= game:GetService("RunService")
-local Players 					= game:GetService("Players")
-
-local isServer 					= RunService:IsServer()
+local HttpService       	= game:GetService("HttpService")
+local ReplicatedStorage 	= game:GetService("ReplicatedStorage")
+local RunService        	= game:GetService("RunService")
+local Players           	= game:GetService("Players")
+local isServer: boolean 	= RunService:IsServer()
 
 if not ReplicatedStorage:FindFirstChild("Events") then
-	local EventsFolder = Instance.new("Folder")
-	EventsFolder.Name = "Events"
-	EventsFolder.Parent = ReplicatedStorage
+    local EventsFolder = Instance.new("Folder")
+    EventsFolder.Name = "Events"
+    EventsFolder.Parent = ReplicatedStorage
 end
 
 --======================
---// COFNIG //
+--// CONFIG //
 --======================
-local REMOTE_NAME 				= "NetworkingRemote"
-local REMOTE_FUNCTION_NAME 		= "NetworkingRemoteFunction"
-local RATE_LIMIT_WINDOW 		= 1 	-- seconds, don't recommend going under 1 second
-local RATE_LIMIT_MAX 			= 8 		-- max fires per window per event per player
+local REMOTE_NAME           	= "NetworkingRemote"
+local REMOTE_FUNCTION_NAME  	= "NetworkingRemoteFunction"
+local RATE_LIMIT_WINDOW     	= 1   -- seconds
+local RATE_LIMIT_MAX        	= 8   -- fires per window per event per player
 
-local DEBUG 					= true
-local MAX_LOG_ENTRIES 			= 40
+local DEBUG                 	= true
+local MAX_LOG_ENTRIES       	= 40
 
-local NONCE_EXPIRATION 			= 8 -- seconds before a nonce becomes invalid
-local CLEAR_PLAYER_NONCE_CACHE 	= 10 -- seconds before clearing nonce cahce
+local NONCE_EXPIRATION     	 	= 8   -- seconds
+local CLEAR_PLAYER_NONCE_CACHE 	= 10
 
 --======================
 --// STORAGE //
 --======================
-local remoteEvent
-local remoteFunction
-local requestHandlers 			= {}
-local c2sListeners 				= {} 		-- eventName -> { listeners = { func }, validators = { func } }
-local s2cListeners 				= {} 		-- eventName -> { listeners = { func } }
-local c2sRateLimits 			= {} 		-- player -> eventName -> { count, lastReset }
-local spyListeners 				= {} 		-- eventName -> { funcs } for spying on fires
-local scopes 					= {} 				-- scopeId -> { disconnectors = {} }
-local trafficLog 				= {}
-local eventGroups 				= {}			-- groupName -> { events = { eventName }, enabled = true }
-local eventToGroups				= {}		-- eventName -> groupName
-local activeNonces 				= {}			-- player.UserId -> { nonceString = expirationTime }
-local noncesCache 				= {}			-- player.UserId -> { eventName = { nonce, timestamp } }
-
-
+local remoteEvent: RemoteEvent?
+local remoteFunction: RemoteFunction?
+local requestHandlers: { [ string ]: RequestHandler } = {}
+local c2sListeners:   { [ string ]: C2SEventConfig } = {}
+local s2cListeners:   { [ string ]: S2CEventConfig } = {}
+local c2sRateLimits:  { [ number ]: { [ string ]: RateLimitEntry } } = {}
+local spyListeners:   { [ string ]: { SpyCallback } } = {}
+local scopes:         { [ string ]: ScopeEntry } = {}
+local trafficLog:     { TrafficEntry } = {}
+local eventGroups:    { [ string ]: EventGroup } = {}
+local eventToGroups:  { [ string ]: string } = {}
+local activeNonces:   { [ number ]: NonceEntry } = {}
+local noncesCache:    { [ number ]: NonceCacheMap } = {}
 
 --======================
 --// DEBUG //
@@ -344,7 +393,7 @@ end
 --======================
 --// HELPER //
 --======================
-local function getRemote()
+local function getRemote(): RemoteEvent
 	if not remoteEvent then
 		remoteEvent = ReplicatedStorage.Events:FindFirstChild(REMOTE_NAME)
 		if not remoteEvent then
@@ -356,7 +405,7 @@ local function getRemote()
 	return remoteEvent
 end
 
-local function getFunction()
+local function getFunction(): RemoteFunction
 	if not remoteFunction then
 		remoteFunction = ReplicatedStorage.Events:FindFirstChild(REMOTE_FUNCTION_NAME)
 		if not remoteFunction then
@@ -368,7 +417,7 @@ local function getFunction()
 	return remoteFunction
 end
 
-local function checkRateLimit(Player : Player, eventName : string)
+local function checkRateLimit(Player : Player, eventName : string): (boolean,string?)
 	if not c2sRateLimits[Player.UserId] then
 		c2sRateLimits[Player.UserId] = {}
 	end
@@ -393,7 +442,7 @@ local function checkRateLimit(Player : Player, eventName : string)
 	return true
 end
 
-local function validateArgs(eventName : string, Player : Player, ... : any)
+local function validateArgs(eventName : string, Player : Player, ... : any): (boolean,string?)
 	local config = c2sListeners[eventName]
 	if not config then return true end 
 	
@@ -448,7 +497,7 @@ local function fireSpies(eventName : string, direction : any, sender : any, ... 
 
 end
 
-local function GenerateNonce(Player: Player, eventName: string): string?
+local function GenerateNonce(Player: Player, eventName: string): string | false
 	if not noncesCache[Player.UserId] then
 		noncesCache[Player.UserId] = {}
 	end
@@ -484,6 +533,7 @@ function NetworkService:ValidateNonce(Player: Player,nonce: string,eventName: st
 
 	if os.clock() > activeNonces[Player.UserId][nonce] then
 		activeNonces[Player.UserId][nonce] = nil
+		log("Nonce "..nonce.." expired")
 		return false 
 	end
 
@@ -498,14 +548,12 @@ function NetworkService:ValidateNonce(Player: Player,nonce: string,eventName: st
 	return true
 end
 
-function NetworkService:RegisterC2S(eventName : string, validator : any, listener : any)
+function NetworkService:RegisterC2S(eventName : string, validator : Validator, listener : Listener, options: FireOptions?)
 	if not isServer then error("RegisterC2S can only be called from server") end
 	if typeof(eventName) ~= "string" or eventName == "" then error("Invalid eventName") end
-	
-	
 
 	if not c2sListeners[eventName] then
-		c2sListeners[eventName] = {listeners = {}, validators = {}}
+		c2sListeners[eventName] = {listeners = {}, validators = {}, options = options } :: C2SEventConfig
 	end
 	
 	table.insert(c2sListeners[eventName].validators,validator)
@@ -516,19 +564,19 @@ function NetworkService:RegisterC2S(eventName : string, validator : any, listene
 	log("Registered C2S event: ",eventName)
 end
 
-function NetworkService:RegisterS2C(eventName : string, listener : any)
+function NetworkService:RegisterS2C(eventName : string, listener : S2CListener)
 	if isServer then error("RegisterS2C can only be called from the client") end
 	if typeof(eventName) ~= "string" or eventName == "" then error("Invalid event name") end
 	
 	if not s2cListeners[eventName] then
-		s2cListeners[eventName] = {listeners = {}}
+		s2cListeners[eventName] = {listeners = {}} :: S2CEventConfig
 	end
 	
 	table.insert(s2cListeners[eventName].listeners, listener)
 	log("Registered S2C event: ",eventName)
 end
 
-function NetworkService:RegisterRequestC2S(eventName: string, handler: any)
+function NetworkService:RegisterRequestC2S(eventName: string, handler: RequestHandler)
 	if not isServer then error("RegisterRequest can only be used to server") end
 	if typeof(eventName) ~= "string" or eventName == "" then error("Invalid request name") end
 	if typeof(handler) ~= "function" then error("Handler must be a function") end
@@ -537,7 +585,7 @@ function NetworkService:RegisterRequestC2S(eventName: string, handler: any)
 	log("Registered C2S RPC:",eventName)
 end
 
-function NetworkService:AddSpy(eventName : string, spy : any)
+function NetworkService:AddSpy(eventName : string, spy : SpyCallback)
 	if typeof(eventName) ~= "string" or eventName == "" then error("Invalid event name") end
 	if typeof(spy) ~= "function" then error("Spy must be a function") end
 	
@@ -550,7 +598,7 @@ function NetworkService:AddSpy(eventName : string, spy : any)
 	
 end
 
-function NetworkService:FireServer(eventName : string, args : any,options: {any}?)
+function NetworkService:FireServer(eventName : string, args : any,options: FireOptions?)
 	if isServer then error("FireServer can only be called from the client") end
 	if typeof(eventName) ~= "string" or eventName == "" then error("Invalid event name") end
 	
@@ -622,7 +670,7 @@ function NetworkService:FireAllClientsInRadius(eventName: string,radius: number,
 
 	for _,Player in pairs(Players:GetPlayers()) do
 		local character = Player.character
-		if character then
+		if character and character:FindFirstChild("HumanoidRootPart") then
 			if (character.HumanoidRootPart.Position - targetCharacter.HumanoidRootPart.Position).Magnitude <= radius then
 				local remote = getRemote()
 				remote:FireClient(Player,...)
@@ -631,11 +679,9 @@ function NetworkService:FireAllClientsInRadius(eventName: string,radius: number,
 	end
 end
 
-
-
-function NetworkService:CreateScope()
+function NetworkService:CreateScope(): Scope
 	local id = HttpService:GenerateGUID(false)
-	scopes[id] = { disconnectors = {} }
+	scopes[id] = { disconnectors = {} } :: ScopeEntry
 
 	local scope = {}
 	log("Created scope: "..tostring(id))
@@ -668,7 +714,7 @@ function NetworkService:CreateScope()
 	return scope
 end
 
-function NetworkService:RequestServer(eventName: string, args: {any?})
+function NetworkService:RequestServer(eventName: string, args: {any?}): any
 	if isServer then error("RequestServer can only be used on client") end
 	if typeof(eventName) ~= "string" then error("Invalid event name") end
 	
@@ -694,7 +740,7 @@ function NetworkService:RegisterGroup(groupName: string,events: {string})
 	log("Registered group: "..groupName.." with events: "..table.concat(events,", "))
 end
 
-function NetworkService:EnableGroup(groupName: string)
+function NetworkService:EnableGroup(groupName: string): ()
 	local group = eventGroups[groupName]
 	if not group then
 		warn("Group doesnt exists: "..groupName)
@@ -705,7 +751,7 @@ function NetworkService:EnableGroup(groupName: string)
 	log("Enabled group: "..groupName)
 end
 
-function NetworkService:DisableGroup(groupName: string)
+function NetworkService:DisableGroup(groupName: string): ()
 	local group = eventGroups[groupName]
 	if not group then
 		warn("Group doesnt exists: "..groupName)
@@ -758,23 +804,44 @@ if isServer then
 		local args = ...
 		local max = table.maxn(...)
 		local eventName = args[max]
-		local requiresNonce = args[max-1]
-		if requiresNonce == true then
-			local nonce = args[max-2]
-			if NetworkService:ValidateNonce(Player,nonce,eventName) == false then
-				warn("[NETWORKSERVICE] Nonce: "..tostring(nonce).." is no longer valid")
-				return
-			else
-				log("Nonce: "..tostring(nonce).." registered")
-				table.remove(args,max-1)
-				table.remove(args,max-2)
-			end
-		end
-		
 		
 		if typeof(eventName) ~= "string" then
 			log("Invalid eventName type from", Player.Name)
 			return
+		end
+
+		local config = c2sListeners[eventName]
+		if not config then
+			log("Unregister C2S event: "..eventName)
+		end
+
+		if config.options then
+			if config.options.requiresNonce then
+				local clientSentNonceFlag = args[max-1]
+
+				if clientSentNonceFlag ~= true then
+					warn("[NetworkService] Event requires nonce but client didn't provide one: "..eventName)
+					return
+				end
+
+				local nonce = args[max-2]
+				if not NetworkService:ValidateNonce(Player,nonce,eventName) then
+					warn("[NetworkService] Invalid nonce for event: "..eventName.." from "..Player.Name)
+					return
+				else
+					log("Nonce validated for: "..eventName)
+					table.remove(args,max-1)
+					table.remove(args,max-2)
+				end
+			else
+				local clientSentNonceFlag = args[max-1]
+				if clientSentNonceFlag == true or clientSentNonceFlag == false then
+					table.remove(args,max-1)
+					if clientSentNonceFlag == true then
+						table.remove(args,max-2)
+					end
+				end
+			end
 		end
 		
 		fireSpies(eventName,"C2S",Player,...)
@@ -894,7 +961,9 @@ end
 
 if isServer then
 	Players.PlayerRemoving:Connect(function(Player : Player)
-		c2sListeners[Player] = nil 
+		c2sListeners[Player.UserId] = nil 
+		activeNonces[Player.UserId] = nil
+		noncesCache[Player.UserId] = nil
 	end)
 end
 
