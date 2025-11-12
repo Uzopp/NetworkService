@@ -17,5 +17,3 @@ Commercial Use: Allowed, as long as credit and original author attribution remai
 Warranty Disclaimer: The software is provided “as is”, without warranty of any kind.
 
 By using or distributing this software, you agree to the above conditions.
-
-Would you like me to also generate a short LICENSE.txt version of that custom license for your repo’s root folder (so GitHub shows it as a license file)?
