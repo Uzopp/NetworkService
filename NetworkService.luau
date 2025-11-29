@@ -3,7 +3,7 @@
                  NetworkService Module
 ==================================================
 Author: UZOPH
-Version: v0.2.2 [BETA]
+Version: v1.0.0 RELEASE
 
 --------------------------------------------------
 OVERVIEW
@@ -19,21 +19,77 @@ It eliminates repetitive boilerplate and introduces:
   • Group-based enable/disable controls
   • Request/Response-style RPCs
   • Built-in traffic logging and debug overlay
+  • Bindable events for server-to-server communication (NEW)
 
-This allows developers to build scalable and secure multiplayer systems
-without manually recreating event validation, request routing, or spam filters.
-
---------------------------------------------------
-NEW IN v0.2.2
---------------------------------------------------
-• Added request timeout support to `RequestServer`
-• Change whole documentation to be more clear
+This enables developers to build scalable and secure multiplayer systems
+without manually recreating routing logic, validation layers, or spam filters.
 
 --------------------------------------------------
-FIXES
+NEW IN v1.0.0
 --------------------------------------------------
-• Fixed log entries going over the log entries frame, limited to 15 log entries which after the older entry gets deleted for the new one to appear
 
+### Fixed
+- **RequestServer without timeout**  
+  Fixed an issue where RequestServer malfunctioned when no timeout value
+  was provided. It now correctly yields until a server response is received.
+
+- **RequestServer timeout logic (coroutine resume bug)**  
+  Fixed a critical issue where timed RequestServer calls attempted to resume
+  non-suspended coroutines, causing runtime errors.  
+  Timeout and non-timeout logic paths are now safely separated, using
+  task.spawn and coroutine handling only when appropriate.  
+  Timeouts now function cleanly without blocking or crashing.
+
+- **Timeout always waiting full duration**  
+  RequestServer no longer waits the *entire* timeout period when unnecessary.
+  It now checks for server responses every 1 second and returns immediately
+  when a reply arrives.
+
+- **Debug overlay instantiation**  
+  The F7 debug overlay was being recreated for every event fired.
+  It now initializes **once per session**, eliminating redundant
+  object creation and improving performance.
+
+### Adjusted
+- **CLEAR_PLAYER_NONCE_CACHE**  
+  Reduced from **10s → 4s**, enabling faster refresh cycles for nonce-based
+  C2S protections. This increases security responsiveness in high-frequency
+  interactions.
+
+- **NONCE_EXPIRATION**  
+  Reduced from **8s → 3s**. This significantly tightens replay protection while
+  remaining fully safe across typical network latency (0.3–1.0 sec).
+
+### Improved
+- **Memory and table efficiency**  
+  Internals now use pre-allocation, table reuse, and reduced dynamic
+  allocations, improving performance under heavy networking load.
+
+- **Clear, professional logging (NEW)**  
+  All user-facing logs have been rewritten for clarity, consistency, and
+  debugging usefulness.
+
+### Optimized
+- **Spy callback storage**  
+  Spy listeners now use pre-allocated tables to reduce GC pressure and improve
+  runtime efficiency.
+
+- **Event group storage**  
+  Groups now pre-size internal arrays via table.create(), avoiding unnecessary
+  reallocations during gameplay.
+
+### Added
+- **Scope:RequestServer**  
+  Scopes can now issue isolated RequestServer calls using:
+      scope:RequestServer(remoteName, arguments, timeout)
+
+- **Expired ratelimit cleaner**  
+  Background cleanup automatically removes outdated ratelimit entries,
+  preventing memory buildup and keeping module internals lean.
+
+- **Bindable events for server-to-server communication**  
+  NetworkService now includes BindableEvents for internal server-server
+  communication, enhancing internal system flexibility.
 
 ==================================================
                    METHODS
@@ -46,22 +102,21 @@ DIRECTION: CLIENT → SERVER
 
 Description:
     Sends a request from the client to the server using a standardized
-    event payload format. The final element in the `arguments` table
-    is automatically reserved for the event name.
+    event payload. The event name is automatically appended as the final
+    argument.
 
-    If the event requires a **nonce** (replay protection), the client
-    automatically requests one from the server before sending the event.
+    If requiresNonce is true, the client obtains and includes a nonce
+    (replay protection) before firing the event.
 
 Arguments:
     • remoteName : string — Registered C2S event name.
-    • arguments  : {any}  — Data to send. Must be a table (can be empty).
+    • arguments  : {any}  — Data to send (table, possibly empty).
     • options    : { requiresNonce: boolean? } — Optional.
-      When true, event will include and validate a nonce.
 
 Notes:
-    • Nonce enforcement protects sensitive events (purchases, currency, etc.).
-    • Automatically rate-limited per player and per event on the server.
-    • Skipped if the event belongs to a disabled group.
+    • Nonces protect sensitive actions (currency, purchases, progression).
+    • Automatically rate-limited server-side.
+    • Ignored if its group is currently disabled.
 
 Example (Client):
     NetworkService:FireServer("PurchaseItem", {ItemId = 12}, {requiresNonce = true})
@@ -72,12 +127,12 @@ NetworkService:FireClient(player: Player, remoteName: string, arguments: {any})
 DIRECTION: SERVER → CLIENT
 
 Description:
-    Sends data from the server to a single client. The system automatically
-    appends the event name to the argument list for listener reference.
+    Sends a structured event to a specific client.
+    NetworkService automatically appends the event name.
 
 Notes:
-    • Skipped if the target event is part of a disabled group.
-    • Automatically visible in the debug overlay if enabled (F7 toggle).
+    • Ignored if the event's group is disabled.
+    • Appears in debug overlay (F7) if enabled.
 
 Example (Server):
     NetworkService:FireClient(player, "DisplayNotification", {"Welcome back!"})
@@ -85,34 +140,28 @@ Example (Server):
 --------------------------------------------------
 NetworkService:RequestServer(remoteName: string, arguments: {any}, timeout: number?) → any
 --------------------------------------------------
-DIRECTION: CLIENT → SERVER (Request/Response)
+DIRECTION: CLIENT → SERVER
 
 Description:
-    Performs a **remote procedure call (RPC)** to the server and yields
-    until the server returns a result or the operation times out.
+    Performs a request/response (RPC) invocation to the server.
 
 Behavior:
-    • If the server responds before the timeout, the response value is returned.
-    • If the timeout (in seconds) elapses without a response, the call returns `false`.
-    • If no timeout is defined, the request may yield indefinitely until the server responds.
+    • Without timeout: yields indefinitely until the server responds.
+    • With timeout: checks for server response every 1 second.
+    • On timeout expiration: returns false.
 
 Arguments:
-    • remoteName : string — Registered request name.
-    • arguments  : {any}  — Arguments to pass to the server handler.
-    • timeout    : number? — Maximum time (in seconds) to wait for response.
+    • remoteName : string
+    • arguments  : {any}
+    • timeout    : number? — Optional timeout in seconds.
 
 Notes:
-    • Server handlers are registered via `RegisterRequestC2S`.
-    • Requests are rate-limited and validated automatically.
-    • Always handle potential `false` returns gracefully.
+    • Validated and rate-limited by the server.
+    • Always check for a false result.
 
-Example (Client):
-    local data = NetworkService:RequestServer("GetInventory", {}, 5)
-    if data then
-        print("Inventory received:", data)
-    else
-        warn("Server request timed out")
-    end
+Example:
+    local inv = NetworkService:RequestServer("GetInventory", {}, 5)
+    if not inv then warn("Request timed out") end
 
 --------------------------------------------------
 NetworkService:RegisterRequestC2S(remoteName: string, handler: (player: Player, arguments: {any}) → any)
@@ -120,13 +169,10 @@ NetworkService:RegisterRequestC2S(remoteName: string, handler: (player: Player, 
 DIRECTION: SERVER ONLY
 
 Description:
-    Registers a server-side request handler that responds to
-    `RequestServer` calls from clients.
+    Registers a server-side function to handle RequestServer calls.
+    Runs in pcall for safety.
 
-    The function runs in a protected (pcall) environment to prevent
-    runtime errors from breaking remote communication.
-
-Example (Server):
+Example:
     NetworkService:RegisterRequestC2S("GetInventory", function(player)
         return player:GetAttribute("InventoryData")
     end)
@@ -134,37 +180,33 @@ Example (Server):
 --------------------------------------------------
 NetworkService:AddSpy(eventName: string, callback: (eventName: string, direction: "C2S" | "S2C", sender: Player?, ...any) → ())
 --------------------------------------------------
-DIRECTION: GLOBAL (Client or Server)
+DIRECTION: GLOBAL
 
 Description:
-    Attaches a passive observer function to a specific event.
-    Spies are called every time the event is fired, allowing
-    for analytics, debugging, or security logging.
+    Attaches a passive observer executed whenever the event fires,
+    useful for analytics and security validation.
 
 Notes:
-    • Spies are run in pcall for safety.
-    • Ideal for lightweight telemetry or anomaly detection.
-    • Do not perform expensive operations inside spy callbacks.
+    • Spies run in pcall.
+    • Avoid heavy work inside callbacks.
 
 Example:
     NetworkService:AddSpy("GiveCoins", function(eventName, direction, sender, amount)
-        if direction == "C2S" and amount and amount > 25000 then
-            warn("[SECURITY] Suspicious currency grant:", sender and sender.Name, amount)
+        if direction == "C2S" and amount > 25000 then
+            warn("[SECURITY] Suspicious currency grant:", sender, amount)
         end
     end)
 
 --------------------------------------------------
 NetworkService:FireAllClientsInRadius(targetCharacter: Model, radius: number, eventName: string, arguments: {any})
 --------------------------------------------------
-DIRECTION: SERVER → CLIENT (Proximity-based)
+DIRECTION: SERVER → CLIENT
 
 Description:
-    Sends a remote event to all clients within a specified radius of
-    a given character. Useful for local visual or sound effects.
+    Sends an event to all players within `radius` of the target character.
 
 Behavior:
-    • Only players whose HumanoidRootPart is within `radius` receive the event.
-    • The event name is automatically appended to the argument list.
+    • Only players within the radius receive the event.
 
 Example (Server):
     NetworkService:FireAllClientsInRadius(
@@ -176,118 +218,161 @@ Example (Server):
 
 Client Example:
     NetworkService:RegisterS2C("ExplosionEvent", function(args)
-        local damage = args.damage
-        local position = args.position
-        print("Explosion at", position, "damage:", damage)
+        print("Explosion at", args.position, "damage:", args.damage)
     end)
 
 --------------------------------------------------
 NetworkService:RegisterGroup / EnableGroup / DisableGroup / IsGroupEnabled
 --------------------------------------------------
-PURPOSE:
-    Organize events into logical groups that can be enabled or disabled
-    dynamically. Useful for subsystems like UI, minigames, or combat.
+Purpose:
+    Organize events into logical groups for dynamic enabling/disabling.
 
 Behavior:
-    • When a group is disabled, all events inside it are ignored.
-    • Re-enabling restores normal functionality.
-    • Events not in any group remain always active.
+    • Disabled groups ignore all related events.
+    • Re-enabling restores functionality.
 
-Example (Server):
+Example:
     NetworkService:RegisterGroup("Combat", {"PlayerAttack", "AbilityUsed"})
     NetworkService:DisableGroup("Combat")
-    NetworkService:FireClient(player, "PlayerAttack", {damage = 50}) -- Ignored
     NetworkService:EnableGroup("Combat")
 
 --------------------------------------------------
-Scopes: CreateScope / scope:RegisterS2C / scope:Destroy
+Scopes: CreateScope / scope:RegisterS2C / scope:RequestServer / scope:Destroy
 --------------------------------------------------
-PURPOSE:
-    Allows UI or temporary systems to register listeners that can be
-    automatically cleaned up when no longer needed.
+Purpose:
+    Allows temporary systems (UI, cutscenes, menus, etc.) to register listeners
+    that auto-clean when the scope is destroyed.
 
-Example (Client):
+Example:
     local scope = NetworkService:CreateScope()
+
     scope:RegisterS2C("UI_Update", function(args)
-        print("UI update received:", args)
+        print("UI updated:", args)
     end)
-    -- When UI closes:
+
+    local inventory = scope:RequestServer("Inventory_Data", {}, 4)
+
     scope:Destroy()
 
 Behavior:
-    • A scope automatically removes all registered listeners on `Destroy()`.
-    • Prevents memory leaks and callback buildup from dynamic systems.
-    • Ideal for menus, temporary UI elements, or limited-duration features.
+    • Destroy() removes all listeners.
+    • Prevents callback buildup and memory leaks.
+
+--------------------------------------------------
+NetworkService:FireServerBindable(arguments: {any})
+--------------------------------------------------
+DIRECTION: SERVER → SERVER
+
+Description:  
+    Invokes a BindableEvent from one server context to another, allowing
+    internal server-to-server communication without involving clients.
+    This is useful for modular systems where different server scripts
+    need to send actions or data to one another in a structured way.
+
+Example (Server):
+    NetworkService:FireServerBindable(
+        "Inventory_Purchase",
+        {
+            player = player,
+            action = "Purchase",
+            item = "Sword"
+        }
+    )
+--------------------------------------------------
+NetworkService:RegisterS2S(arguments: {any})
+--------------------------------------------------
+DIRECTION: SERVER ONLY
+
+Description:  
+    Registers a server-to-server BindableEvent listener.  
+    When the specified server event is fired using `FireServerBindable`,
+    the associated callback will run and receive the provided arguments.
+
+Example:
+    NetworkService:RegisterS2S("Inventory_Purchase", function(player, args)
+        -- Handle purchase logic here
+    end)
 
 --------------------------------------------------
 Security & Debugging Tools
 --------------------------------------------------
-  • Nonces — replay protection for sensitive C2S events.
-  • Rate limiting — prevents remote event spam and brute-force attacks.
-  • AddSpy — passive monitoring for analytics or security.
-  • Debug Overlay (F7) — live view of traffic and event activity.
-  • Timeout-aware RequestServer calls to avoid indefinite yielding.
+  • Nonce-based C2S replay protection
+  • Centralized rate limiting
+  • Spy callbacks
+  • Debug overlay (F7)
+  • Clean, optimized logging (v1.0.1)
+  • Timeout-aware RPC requests
 
 ==================================================
 Notes & Best Practices
 ==================================================
-  • Always validate all client-sent data on the server.
-  • Keep validator functions deterministic and lightweight.
-  • Use Scopes to manage listeners for temporary systems.
-  • Enable Nonces for anything involving in-game currency or rewards.
-  • Use AddSpy or traffic logs only for development or monitoring.
-  • Combine Groups with Scopes for modular, safe, and flexible systems.
+  • Always validate client-submitted data.
+  • Keep validation deterministic and lightweight.
+  • Use Scopes for temporary or UI systems.
+  • Use Nonces for sensitive actions (currency, progression).
+  • Group events for modular control.
+  • Use Spy logs & debug overlay for monitoring and debugging.
 
 ==================================================
 END OF DOCUMENTATION
 ==================================================
-]]
+]]--
+
 
 --======================
 --// TYPES //
 --======================
-export type Validator       = ( player: Player, args: { any }) -> ( boolean, string? )
-export type Listener        = ( player: Player, args: { any } ) -> ()
-export type C2SEventConfig  = {
+type Validator       = ( player: Player, args: { any }) -> ( boolean, string? )
+type Listener        = ( player: Player, args: { any } ) -> ()
+type S2SListener	 = (args: { any } ) -> ()
+
+type C2SEventConfig  = {
 	validators: { Validator },
 	listeners:  { Listener },
 	options: { any }?
 }
-export type S2CListener     = (args: {any}) -> ()
-export type S2CEventConfig  = {
+
+type S2SEventConfig = {
+	listeners: { Listener }
+}
+
+type S2CListener     = (args: {any}) -> ()
+type S2CEventConfig  = {
 	listeners: { S2CListener },
 }
-export type RequestHandler  = (player: Player, args: { any }?) -> any
-export type SpyCallback     = (eventName: string, direction: "C2S" | "S2C", player: Player?, ...any) -> ()
-export type RateLimitEntry  = {
+type RequestHandler  = (player: Player, args: { any }?) -> any
+
+type SpyCallback     = (eventName: string, direction: "C2S" | "S2C", player: Player?, ...any) -> ()
+type RateLimitEntry  = {
 	count: number,
 	lastReset: number,
 }
-export type ScopeEntry      = {
+type ScopeEntry      = {
 	disconnectors: { () -> () },
 }
-export type Scope           = {
+type Scope           = {
 	RegisterS2C: ( self: Scope, eventName: string, listener: S2CListener ) -> (),
+	RequestServer: ( self: Scope, eventName: string, args: { any }, timeout: number?) -> (),
 	Destroy:     ( self: Scope ) -> (),
 }
-export type EventGroup      = {
+type EventGroup      = {
 	events: { string },
 	enabled: boolean,
 }
-export type NonceEntry      = { [ string ]: number } 
-export type NonceCacheEntry = {
+type NonceEntry      = { [ string ]: number } 
+type NonceCacheEntry = {
 	nonce: string,
 	timestamp: number,
 }
-export type NonceCacheMap   = { [ string ]: NonceCacheEntry }
-export type TrafficEntry    = {
+type NonceCacheMap   = { [ string ]: NonceCacheEntry }
+type TrafficEntry    = {
 	time: number,
 	event: string,
 	dir: string,
 	sender: string,
 	args: { string },
 }
-export type FireOptions     = {
+type FireOptions     = {
 	requiresNonce: boolean?
 }
 
@@ -298,6 +383,7 @@ local HttpService       	= game:GetService("HttpService")
 local ReplicatedStorage 	= game:GetService("ReplicatedStorage")
 local RunService        	= game:GetService("RunService")
 local Players           	= game:GetService("Players")
+local MessagingService		= game:GetService("MessagingService")
 local isServer: boolean 	= RunService:IsServer()
 
 if not ReplicatedStorage:FindFirstChild("Events") then
@@ -311,6 +397,7 @@ end
 --======================
 local REMOTE_NAME           	= "NetworkingRemote"
 local REMOTE_FUNCTION_NAME  	= "NetworkingRemoteFunction"
+local REMOTE_BINDABLE_NAME		= "NetworkingRemoteBindable"
 local RATE_LIMIT_WINDOW     	= 1   -- seconds
 local RATE_LIMIT_MAX        	= 8   -- fires per window(frame) per event per player
 
@@ -318,16 +405,20 @@ local DEBUG                 	= true
 local MAX_LOG_ENTRIES       	= 15 -- 15 log entries before the oldest entry gets removed for the new one to appear
 
 local NONCE_EXPIRATION     	 	= 8   -- seconds
-local CLEAR_PLAYER_NONCE_CACHE 	= 10 -- clears nonce cache for given eventName and allows for a new nonce
+local CLEAR_PLAYER_NONCE_CACHE 	= 4 -- clears nonce cache for given eventName and allows for a new nonce
+
+local CLEANUP_TIME = 60 -- seconds
 
 --======================
 --// STORAGE //
 --======================
 local remoteEvent: RemoteEvent?
 local remoteFunction: RemoteFunction?
+local remoteBindable: BindableEvent?
 local requestHandlers: { [ string ]: RequestHandler } = {}
 local c2sListeners:   { [ string ]: C2SEventConfig } = {}
 local s2cListeners:   { [ string ]: S2CEventConfig } = {}
+local s2sListeners:	   { [ string ]: S2SEventConfig } = {}
 local c2sRateLimits:  { [ number ]: { [ string ]: RateLimitEntry } } = {}
 local spyListeners:   { [ string ]: { SpyCallback } } = {}
 local scopes:         { [ string ]: ScopeEntry } = {}
@@ -373,6 +464,18 @@ local function getFunction(): RemoteFunction
 	return remoteFunction
 end
 
+local function getBindable(): BindableEvent
+	if not remoteBindable then
+		remoteBindable = ReplicatedStorage.Events:FindFirstChild(REMOTE_BINDABLE_NAME)
+		if not remoteBindable then
+			remoteBindable = Instance.new("BindableEvent")
+			remoteBindable.Name = REMOTE_BINDABLE_NAME
+			remoteBindable.Parent = ReplicatedStorage.Events
+		end
+	end
+	return remoteBindable
+end
+
 local function checkRateLimit(Player : Player, eventName : string): (boolean,string?)
 	if not c2sRateLimits[Player.UserId] then
 		c2sRateLimits[Player.UserId] = {}
@@ -396,6 +499,24 @@ local function checkRateLimit(Player : Player, eventName : string): (boolean,str
 	data.count += 1
 
 	return true
+end
+
+local function cleanupExpiredRateLimits()
+	local now = os.clock()
+	for userId, events in pairs(c2sRateLimits) do
+		for eventName, data in pairs(events) do
+			print(data)
+			if now - data.lastReset > RATE_LIMIT_WINDOW * 2 then
+				events[eventName] = nil
+			end
+		end
+		if next(events) == nil then
+			c2sRateLimits[userId] = nil
+		end
+	end
+	if DEBUG then
+		log("Cleaned expired rate limits")
+	end
 end
 
 local function validateArgs(eventName : string, Player : Player, ... : any): (boolean,string?)
@@ -424,21 +545,24 @@ local function fireSpies(eventName : string, direction : any, sender : any, ... 
 			pcall(spy,eventName,direction,sender,...)
 		end
 	end
-
 	if DEBUG then
 		local rawArgs = {...}
-		local displayArgs = {}
-		for i, v in ipairs(rawArgs) do
-			if typeof(v) == "table" then
+		local argCount = #rawArgs
+		local displayArgs = table.create(argCount)
+		
+		for i = 1, argCount do
+			local v = rawArgs[i]
+			local vType = typeof(v)
+			if vType == "table" then
 				displayArgs[i] = "<table>"
-			elseif typeof(v) == "Instance" then
+			elseif vType == "Instance" then
 				displayArgs[i] = v:GetFullName()
 			else
 				displayArgs[i] = tostring(v)
 			end
 		end
 
-		table.insert(trafficLog, 1, {
+		table.insert(trafficLog, {
 			time = os.clock(),
 			event = eventName,
 			dir = direction,
@@ -447,31 +571,41 @@ local function fireSpies(eventName : string, direction : any, sender : any, ... 
 		})
 
 		if #trafficLog > MAX_LOG_ENTRIES then
-			table.remove(trafficLog,1)
+			table.remove(trafficLog, 1)
 		end
 	end
 
 end
 
 local function GenerateNonce(Player: Player, eventName: string): string | false
-	if not noncesCache[Player.UserId] then
-		noncesCache[Player.UserId] = {}
+	local userId = Player.UserId
+	local userCache = noncesCache[userId]
+	
+	if not userCache then
+		userCache = {}
+		noncesCache[userId] = userCache
 	end
-	if noncesCache[Player.UserId][eventName] then 
-		if tick() - noncesCache[Player.UserId][eventName].timestamp >= CLEAR_PLAYER_NONCE_CACHE then
-			noncesCache[Player.UserId][eventName] = nil
+	
+	local cachedEntry = userCache[eventName]
+	if cachedEntry then 
+		if tick() - cachedEntry.timestamp >= CLEAR_PLAYER_NONCE_CACHE then
+			userCache[eventName] = nil
 		else
-			warn("[NetworkService] Cache found for event: "..eventName..", can't create nonce") return false 
+			warn("[NetworkService] Cache found for event: "..eventName..", can't create nonce")
+			return false 
 		end
 	end
+	
 	local nonce = HttpService:GenerateGUID(false)
 	local now = os.clock()
 
-	if not activeNonces[Player.UserId] then
-		activeNonces[Player.UserId] = {}
+	local userNonces = activeNonces[userId]
+	if not userNonces then
+		userNonces = {}
+		activeNonces[userId] = userNonces
 	end
 
-	activeNonces[Player.UserId][nonce] = now + NONCE_EXPIRATION
+	userNonces[nonce] = now + NONCE_EXPIRATION
 
 	return nonce
 end
@@ -502,6 +636,19 @@ function NetworkService:ValidateNonce(Player: Player,nonce: string,eventName: st
 	noncesCache[Player.UserId][eventName] = {nonce = nonce,timestamp = tick()}
 
 	return true
+end
+
+function NetworkService:RegisterS2S(eventName: string,listener: S2SListener)
+	if not isServer then error("RegisterS2S can only be called from server") end
+	if typeof(eventName) ~= "string" or eventName == "" then error("Invalid eventName") end
+	
+	if not s2sListeners[eventName] then
+		s2sListeners[eventName] = {listeners = {}} :: S2SEventConfig
+	end
+	
+	table.insert(s2sListeners[eventName].listeners,listener)
+	
+	log("Registered S2S Event: ",eventName)
 end
 
 function NetworkService:RegisterC2S(eventName : string, validator : Validator, listener : Listener, options: FireOptions?)
@@ -551,7 +698,6 @@ function NetworkService:AddSpy(eventName : string, spy : SpyCallback)
 
 	table.insert(spyListeners[eventName],spy)
 	log("Added spy for event: ",eventName)
-
 end
 
 function NetworkService:FireServer(eventName : string, args : any,options: FireOptions?)
@@ -579,7 +725,7 @@ function NetworkService:FireServer(eventName : string, args : any,options: FireO
 	local remote = getRemote()
 	remote:FireServer(args)
 	fireSpies(eventName,"C2S",nil,args)
-	log("Fired to server: ",eventName)
+	log("Fired from client to server: ",eventName)
 end
 
 function NetworkService:FireClient(Player : Player, eventName : string, ... : any)
@@ -597,7 +743,23 @@ function NetworkService:FireClient(Player : Player, eventName : string, ... : an
 	local remote = getRemote()
 	remote:FireClient(Player,...)
 	fireSpies(eventName,"S2C",Player,...)
-	log("Fired to client: ", Player.Name,eventName)
+	log("Fired from server to client: ", Player.Name,eventName)
+end
+
+function NetworkService:FireServerBindable(eventName: string, ... : any)
+	if not isServer then error("FireServerBindable can only be called from the server") end
+	if typeof(eventName) ~= "string" or eventName == "" then error("Invalid event name") end
+	if not isEventEnabled(eventName) then
+		log("Skipped firing event (group disabled): "..eventName)
+		return
+	end
+	
+	table.insert(...,eventName)
+	
+	local remote = getBindable()
+	remote:Fire(...)
+	fireSpies(eventName,"S2S",nil,...)
+	log("Fire from server to server: ",eventName)
 end
 
 function NetworkService:FireAllClients(eventName : string, ... : any)
@@ -609,7 +771,7 @@ function NetworkService:FireAllClients(eventName : string, ... : any)
 	local remote = getRemote()
 	remote:FireAllClients(...)
 	fireSpies(eventName,"S2C",nil,...)
-	log("Fired to all clients: ",eventName)
+	log("Fired to all clients from server: ",eventName)
 end
 
 function NetworkService:FireAllClientsInRadius(eventName: string,radius: number,targetCharacter: Model,... : any)
@@ -635,9 +797,11 @@ function NetworkService:FireAllClientsInRadius(eventName: string,radius: number,
 	end
 end
 
-function NetworkService:CreateScope(): Scope
+function NetworkService:CreateScope(Player: Player?): Scope
 	local id = HttpService:GenerateGUID(false)
-	scopes[id] = { disconnectors = {} } :: ScopeEntry
+	scopes[id] = {
+		disconnectors = {},
+	} :: ScopeEntry
 
 	local scope = {}
 	log("Created scope: "..tostring(id))
@@ -658,6 +822,24 @@ function NetworkService:CreateScope(): Scope
 		end)
 		log("Register S2C event for scope: "..tostring(id))
 	end
+	
+	function scope:RequestServer(eventName: string,args: {any}, timeout: number?)
+		if isServer then error("RequestServer can only be called from the client") end
+		if typeof(eventName) ~= "string" or eventName == "" then error("Invalid event name") end
+		if not isEventEnabled(eventName) then
+			log("Skipped firing event (group disabled): "..eventName)
+			return
+		end
+	
+		local func = getFunction()
+		local success, result = pcall(func.InvokeServer, func, eventName, args)
+		if success then
+			return result
+		else
+			warn("RequestServer error (no timeout):", result)
+			return false
+		end
+	end
 
 	function scope:Destroy()
 		for _,undo in ipairs(scopes[id].disconnectors) do
@@ -671,21 +853,48 @@ function NetworkService:CreateScope(): Scope
 end
 
 function NetworkService:RequestServer(eventName: string, args: {any?}, timeout: number?): any
-	if isServer then error("RequestServer can only be used on client") end
-	if typeof(eventName) ~= "string" then error("Invalid event name") end
+    if isServer then error("RequestServer can only be used on client") end
+    if typeof(eventName) ~= "string" then error("Invalid event name") end
 
-	local func = getFunction()
-	local data
-	task.spawn(function()
-		data = func:InvokeServer(eventName,args)
-	end)
-	task.wait(timeout)
-	if not data then
-		log("Request Server "..eventName.." timed out in: "..tostring(timeout))
-		return false
-	else
-		return data
-	end
+    local func = getFunction()
+
+    if not timeout then
+        local success, result = pcall(func.InvokeServer, func, eventName, args)
+        if success then
+            return result
+        else
+            warn("RequestServer error (no timeout):", result)
+            return false
+        end
+    end
+
+
+    local start = os.clock()
+    local co = coroutine.running()
+    local responseReceived = false
+    local responseValue
+
+    task.spawn(function()
+        local success, result = pcall(func.InvokeServer, func, eventName, args)
+        if not responseReceived then 
+            responseValue = success and result or false
+            responseReceived = true
+            if coroutine.status(co) == "suspended" then
+                coroutine.resume(co)
+            end
+        end
+    end)
+
+    while os.clock() - start < timeout do
+        if responseReceived then
+            return responseValue
+        end
+        task.wait()
+    end
+
+    responseReceived = true 
+    log("RequestServer timed out: " .. eventName)
+    return false
 end
 
 function NetworkService:RegisterGroup(groupName: string,events: {string})
@@ -696,10 +905,15 @@ function NetworkService:RegisterGroup(groupName: string,events: {string})
 		error("Events must be provided in a table")
 	end
 
-	eventGroups[groupName] = { events = {}, enabled = true}
-	for _,eventName in ipairs(events) do
+	local eventCount = #events
+	eventGroups[groupName] = {
+		events = table.create(eventCount),
+		enabled = true
+	}
+	local groupEvents = eventGroups[groupName].events
+	for _, eventName in ipairs(events) do
 		if typeof(eventName) == "string" and eventName ~= "" then
-			table.insert(eventGroups[groupName].events,eventName)
+			table.insert(groupEvents, eventName)
 			eventToGroups[eventName] = groupName
 		end
 	end
@@ -748,6 +962,30 @@ if isServer then
 		end
 		return false
 	end)
+	getBindable().Event:Connect(function(args: {any})
+		local args = args or {}
+		local max = #args
+		local eventName = args[max]
+		
+		if typeof(eventName) ~= "string" then
+			log("Invalid eventName type")
+			return
+		end
+		
+		local config = s2sListeners[eventName]
+		if not config then
+			log("No listener for event: "..eventName)
+			return
+		end
+		
+		for _,listener in ipairs(config.listeners) do
+			local ok,err = pcall(listener, args)
+			if not ok then
+				warn("Error in S2S handler for: ",eventName,":",err)
+			end
+		end
+		
+	end)
 	getFunction().OnServerInvoke = function(Player: Player, eventName: string, args: {any}?)
 
 		local success, rateErr = checkRateLimit(Player,eventName)
@@ -768,7 +1006,7 @@ if isServer then
 	end
 	getRemote().OnServerEvent:Connect(function(Player : Player, ... : any)
 		local args = ...
-		local max = table.maxn(...)
+		local max = #args
 		local eventName = args[max]
 
 		if typeof(eventName) ~= "string" then
@@ -837,11 +1075,10 @@ if isServer then
 		end
 	end)
 else
-	getRemote().OnClientEvent:Connect(function(...)
-
-		if DEBUG and RunService:IsStudio() then
-			task.defer(function()
-
+	if DEBUG and RunService:IsStudio() then
+			task.spawn(function()
+				task.defer(function()
+			
 				local Player = game.Players.LocalPlayer
 				local PlayerGui = Player:WaitForChild("PlayerGui")
 
@@ -897,10 +1134,11 @@ else
 					end
 				end)
 			end)
-		end
-
+		end)
+	end
+	getRemote().OnClientEvent:Connect(function(...)
 		local args = ...
-		local max = table.maxn(...)
+		local max = #args
 		local eventName = args[max]
 
 		if typeof(eventName) ~= "string" then
@@ -922,14 +1160,18 @@ else
 			log("Unregistered S2C event: ",eventName)
 		end
 	end)
-
 end
 
 if isServer then
+	task.spawn(function()
+		while true do
+			task.wait(CLEANUP_TIME)
+			cleanupExpiredRateLimits()
+		end
+	end)
 	Players.PlayerRemoving:Connect(function(Player : Player)
 		c2sListeners[Player.UserId] = nil 
 		activeNonces[Player.UserId] = nil
-		noncesCache[Player.UserId] = nil
 	end)
 end
 
